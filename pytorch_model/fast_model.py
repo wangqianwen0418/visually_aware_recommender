@@ -3,40 +3,48 @@ from PIL import Image
 from scipy.misc import imresize
 import random
 import numpy as np
-from scipy.ndimage.filters import gaussian_filter
-from scipy.ndimage.interpolation import zoom
 import os
 
 import torch
 import torchvision
 from torch.autograd import Variable as V
-from torchvision import transforms as trn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-workdir = '/home/qianwen/KDD/cfree/ckpt/alexnet_pretrained_50_dropout'
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--kernel_wd", type=float, default=1e-2, 
+                         help="weight decay of the kernel, default to 1e-2")
+parser.add_argument("--linear_wd", type=float, default=1e-4,
+                         help="weight decay of the linear layer, default to 1e-4")
+parser.add_argument("--dropout", type=bool, default=False,
+                         help="wether to use dropout layer, default to false")
+args = parser.parse_args()
+print(args.kernel_wd, args.dropout)
+workdir = '/home/qianwen/KDD/cfree/ckpt/alexnet_pretrained_50_dropout{}_{}'.format(args.dropout, args.kernel_wd)
 if not os.path.exists(workdir):
     os.mkdir(workdir)
 
 dataset_name = 'AmazonFashion6ImgPartitioned.npy'
-dataset_dir = '/home/qianwen/KDD/dataset/amazon/'
+dataset_dir = '/home/qianwen/KDD/dataset/'
 dataset = np.load(dataset_dir + dataset_name, encoding = 'bytes')
 
 [user_train, user_validation, user_test, Item, usernum, itemnum] = dataset
-non_cold_usernum = 20391
 
 latent_d = 50
 batch_size = 128
-net = torchvision.models.alexnet(pretrained=True)
-# for param in net.parameters():
-#    param.requires_grad = False
-# net.fc = torch.nn.Linear(512, latent_d)
+
 
 class Siamese(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, latent_d, batch_size, usernum):
         super(Siamese, self).__init__()
+        net = torchvision.models.alexnet(pretrained=True)
         self.features = net.features
-        self.classifier = torch.nn.Sequential(torch.nn.Dropout(0.5), net.classifier[1], net.classifier[2], torch.nn.Dropout(0.5), net.classifier[4])
+        if args.dropout:
+            self.classifier = torch.nn.Sequential(torch.nn.Dropout(0.5), net.classifier[1], net.classifier[2], torch.nn.Dropout(0.5), net.classifier[4], net.classifier[5])
+        else:
+            self.classifier = torch.nn.Sequential(net.classifier[1], net.classifier[2], net.classifier[4], net.classifier[5]) 
         self.linear = torch.nn.Linear(4096, latent_d)
         self.kernel = torch.nn.Parameter(torch.randn(usernum, latent_d).cuda())
         
@@ -85,10 +93,10 @@ class AmazonDataset(Dataset):
         return u, img_i, img_j
 
 
-def evaluate(model, mode="sampling", batch_num=10):
+def evaluate(model):
     scores = []
     validation_dataset = AmazonDataset(user_validation, transforms)
-    validation_generator = DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, num_workers=32, drop_last=True)
+    validation_generator = DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True)
     model.eval()
     for index, input_i, input_j in validation_generator:
         input_i = input_i.cuda()
@@ -98,36 +106,37 @@ def evaluate(model, mode="sampling", batch_num=10):
     model.train()
     return sum(scores) / len(scores)
 
-siamese_net = Siamese()
+siamese_net = Siamese(latent_d, batch_size, usernum)
 siamese_net.cuda()
-# siamese_net.load_state_dict(torch.load('/home/qianwen/KDD/cfree/ckpt/alexnet_50/iteration_1'))
 training_dataset = AmazonDataset(user_train, transforms)
-training_generator = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=16, drop_last = True)
-learning_rate = 1e-4
+training_generator = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True)
 params = []
 for name, param in siamese_net.named_parameters():
-    if param.requires_grad:
-        params.append({'params': [param], 
-			'weight_decay': 1e-2 if name=='kernel' else 1e-3,
-			'lr': 1e-2 if name=='kernel' else 1e-4})
-optimizer1 = torch.optim.Adam(params)
-params = []
-for name, param in siamese_net.named_parameters():
-    if param.requires_grad:
-        params.append({'params': [param],
-                        'weight_decay': 1e-2 if name=='kernel' else 1e-3,
-                        'lr': 1e-4 if name=='kernel' else 1e-4})
-optimizer2 = torch.optim.Adam(params)
+    if name == 'kernel':
+        params.append({'params': [param], 'weight_decay': args.kernel_wd, 'lr': 1e-4})
+    else:
+        params.append({'params': [param], 'weight_decay': 1e-4,'lr': 1e-4})
+optimizer = torch.optim.Adam(params)
+
+def learning_rate_schedule(optimizer, iteration):
+    if iteration == 3:
+        for param in optimizer.param_groups:
+            param['lr'] = 1e-4
+    # elif iteration == 10:
+    #     for param in optimizer.param_groups:
+    #         param['lr'] = 1e-6
+
 f = open(os.path.join(workdir, 'log.txt'), 'w')
 max_iteration = 50
 print("Training begin:")
 for iteration in range(max_iteration):
     step = 0
-    score = evaluate(siamese_net, mode='traversal')
+    score = evaluate(siamese_net)
     print("Iteration {} Validation Score {}".format(iteration, score))
     f.write("Iteration {} Validation Score {}\n".format(iteration, score))
     f.flush()
     torch.save(siamese_net.state_dict(), os.path.join(workdir, 'iteration_{}'.format(iteration)))
+    # learning_rate_schedule(optimizer, iteration)
     for index, input_i, input_j in training_generator:
         input_i = input_i.cuda()
         input_j = input_j.cuda()
@@ -136,14 +145,9 @@ for iteration in range(max_iteration):
         score = round(float(torch.sum(torch.sum(output_i, 1) > torch.sum(output_j, 1))) / batch_size, 3)
         loss = -distance
         print('Iteration {}, Step {}, Loss {}, Score {}'.format(iteration, step, loss, score))
-        if iteration < 4:
-            optimizer1.zero_grad()
-            loss.backward()
-            optimizer1.step()
-        else:
-            optimizer2.zero_grad()
-            loss.backward()
-            optimizer2.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
         step += 1
-    
 f.close()
+
